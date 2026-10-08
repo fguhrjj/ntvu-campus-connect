@@ -1,11 +1,11 @@
 # 校园网自动连接（CampusConnect）设计
 
 日期：2026-10-08
-状态：设计已逐节认可，待用户审阅本文档
+状态：设计已逐节认可；2026-10-08 修订第 2.4–2.6 节（统一身份认证实际走 `cas-sso` 委托 `authserver`），待用户审阅本文档
 
 ## 1. 目标与范围
 
-在 Windows 上常驻托盘，连接 `NTVU-R` 时自动完成南通职业大学校园网门户认证（CAS 学号密码 → 运营商选择 → 在线确认），掉线自动重连。
+在 Windows 上常驻托盘，连接 `NTVU-R` 时自动完成南通职业大学校园网门户认证（统一身份认证学号密码 → 运营商选择 → 在线确认），掉线自动重连。
 
 - 单个 `CampusConnect.exe`，不依赖浏览器、Node、.NET 或 PowerShell 运行时。
 - 纯 HTTP 实现门户协议；不启动浏览器。
@@ -13,7 +13,7 @@
 
 ## 2. 已核实的门户协议（2026-10-08 实测）
 
-门户为锐捷 SAM/ePortal + 自研 CAS（`/cas-sso`）。以下来自实际请求与公开前端 bundle（`/portal/7243.419d7f3f5d4cfcb769b0.js`、`/portal/8246.a50830a312a6505042af.js`、`/portal/2972.7b7b34964e0336a8a332.js`、`/portal/6066.cd34009bb31fa414a15a.js`、`/sso-public/cas-login-new/main.js`）。
+门户为锐捷 SAM/ePortal + 锐捷 CAS（`/cas-sso`，pac4j 委托认证）+ 学校统一身份认证（`https://authserver.ntvu.edu.cn/authserver`）。以下来自实际请求与公开前端 bundle（`/portal/7243.419d7f3f5d4cfcb769b0.js`、`/portal/8246.a50830a312a6505042af.js`、`/portal/2972.7b7b34964e0336a8a332.js`、`/portal/6066.cd34009bb31fa414a15a.js`、`/sso-public/cas-login-new/main.js`、`/authserver/cusTheme20251022/static/common/encrypt.js`、`/authserver/cusTheme20251022/customStatic/web/js/login.js`）。
 
 ### 2.1 会话发现
 
@@ -38,32 +38,38 @@ GET https://nap.ntvu.edu.cn/eportal/redirect.jsp
 
 - `POST /eportal/network/serviceLogin` `{"sessionId":…,"service":"CUCC"}`：仅当 `code==200 && data.authResult=="success"` 视为提交成功，随后前端调用 `getCurrentNode` 取下一节点；`authResult` 不为 `success` 时取 `data.authMessage` 作为错误信息；`code!=200` 时取 `message`（`/portal/2972…js` `submitForm`）。
 
-### 2.4 CAS 登录（`/cas-sso`）
+### 2.4 统一身份认证（`cas-sso` 委托 `authserver`）
 
-1. `GET /cas-sso/login?flowSessionId=<sessionId>&customPageId=<id>&preview=false&appType=normal&language=zh-CN&timer=<毫秒时间戳>&nasIp=…&userIp=…&ssid=…&nodeMac=<userMac>`（与门户 iframe `PcAuthenticate.ngOnInit` 构造的参数一致，`window.__PLATFORM_SSO__ = 'cas-sso'`；`nodeMac` 取跳转参数 `userMac` 属 [推断]）：服务端下发 `SESSION` Cookie（`Path=/cas-sso/`），页面中的隐藏 `<p id>` 字段：
-   - `login-croypto`：24 字符 base64，即 AES-128 密钥
-   - `login-page-flowkey`：表单 `execution` 值
-   - `current-login-type`（应为 `UsernamePassword`）、`riskSystemSwitch`（应为 `default`）、`login-error-code`、`loginFailMessage`
-2. `GET /cas-sso/api/protected/user/captchaCount/validate?userName=<学号>`：`data.captchaInvisible` 为真则需要验证码 → 停止并提示。
-3. `POST /cas-sso/login?<第 1 步的原始查询串>&accept-language=zh-CN`，`application/x-www-form-urlencoded`：
-   `type=UsernamePassword`、`_eventId=submit`、`geolocation=`、`execution=<flowkey>`、`captcha_code=`、`username=<学号>`、`rememberMe=false`、`croypto=<key>`、`password=AES(key, 密码)`、`captcha_payload=AES(key, "{}")`。
-   `AES(k,t)` = AES-128-ECB + PKCS#7，密钥为 `base64decode(k)`，输出 base64 密文（与 CryptoJS `AES.encrypt(t, Base64.parse(k), {mode:ECB,padding:Pkcs7}).toString()` 一致）。
-4. 结果判定：不自动跟随 POST 的 302，仅记录 Location 的路径与参数名（不记参数值）。响应页面 `login-error-code` 非空即失败；错误码 `1030027`/`1030031` 账号或密码错误、`1030028` 账号锁定、`1410040`/`1410041` 用户名无效、`1320007`/`1320010` 需要验证码、`1330001` 账号风控，其它非空错误码归为 `NeedsAttention`。无错误码（含 302）视为“已提交”，以后续 `getCurrentNode` 是否离开 `authenticate` 为准。
+门户认证页的 iframe 加载 `/cas-sso/login`。带 `flowSessionId` 时页面 `current-login-type=adapter`，内联脚本按 `ruleList`（`adapter`，`isRedirect=true`）向父页面发 `jumpRedirectFunction`，门户随即在顶层打开 `clientredirect`；账号密码表单实际在 `authserver`。`cas-sso` 自身的 `UsernamePassword` 表单在门户模式下不被使用，本程序不向其提交凭据。同代锐捷门户的开源客户端（`Youwenqwq/ysu-sdk`，`client_name=sidadapter`）同样走 `clientredirect`，可作旁证。
+
+第 1–4 步 2026-10-08 实测（未提交凭据）：
+
+1. `GET https://nap.ntvu.edu.cn/cas-sso/login?flowSessionId=<sessionId>&customPageId=<id>&preview=false&appType=normal&language=zh-CN&timer=<毫秒时间戳>&nasIp=…&userIp=…&ssid=…&nodeMac=<userMac>`（参数与门户 `PcAuthenticate.ngOnInit` 一致；`nodeMac` 取跳转参数 `userMac` 属 [推断]）→ 200，下发 `SESSION`（`Path=/cas-sso/`）。页面隐藏字段 `current-login-type` 必须为 `adapter`，否则 `PortalChanged`。
+2. `GET https://nap.ntvu.edu.cn/cas-sso/clientredirect?client_name=adapter&accept-language=zh-CN&service=<门户认证页 URL>` → 302，下发 `PAC4JDELSESSION`（`Path=/cas-sso`）。Location 必须为 `https://authserver.ntvu.edu.cn/authserver/login?service=<https://nap.ntvu.edu.cn/cas-sso/login?client_name=adapter&accept-language=zh-CN&delegatedclientid=…>`，否则 `PortalChanged`。`service` 取 `https://nap.ntvu.edu.cn/portal/entry/pc/authenticate`：浏览器中为当时的 `window.location.href`，确切形式属 [推断]。
+3. `GET` 第 2 步的 Location → 200，下发 `route`、`JSESSIONID`（`Path=/authserver`）。解析表单 `#pwdFromId`：`execution`、`lt`（空）、`_eventId=submit`、`cllt=userNameLogin`、`dllt=generalLogin`，以及无 `name` 的 `#pwdEncryptSalt`（16 字符）。缺任一字段 → `PortalChanged`。页面变量 `captchaSwitch="1"`（图片验证码）、`_badCredentialsCount="3"`。
+4. `GET https://authserver.ntvu.edu.cn/authserver/checkNeedCaptcha.htl?username=<学号>&_=<毫秒时间戳>` → `{"isNeed":false}`。`isNeed` 为真 → `CaptchaRequired`；`isNeedActive` 为真 → `NeedsAttention`（账号待激活）。
+5. `POST` 第 3 步同一 URL（`/authserver/login?service=…`），`application/x-www-form-urlencoded`：`username=<学号>`、`password=<加密密码>`、`captcha=`、`_eventId=submit`、`cllt=userNameLogin`、`dllt=generalLogin`、`lt=`、`execution=<值>`。明文框 `passwordText` 提交前被禁用，不发送。
+   加密（`encrypt.js` `encryptPassword`）：`base64(AES-CBC-PKCS7(key=UTF8(salt.trim()), iv=UTF8(16 位随机串), 明文=64 位随机串 + 密码))`，随机字符取自 `ABCDEFGHJKMNPQRSTWXYZabcdefhijkmnprstwxyz2345678`。盐为 16 字节，即 AES-128。
+6. 第 5 步结果（不自动跟随）：
+   - 302 且 Location 为 `https://nap.ntvu.edu.cn/cas-sso/login?…`（含 `ticket` 参数）→ 继续第 7 步。
+   - 200 → 失败，取 `#showErrorTip` 文本作为提示，归为 `AuthenticationRejected`。随即暂停自动登录，避免连续 3 次错误后出现验证码或锁定。
+   - 其它 Location（如改密、完善信息）→ `NeedsAttention`。
+7. `GET` 回调 URL：`cas-sso` 用 ticket 向 `authserver` 的 `serviceValidate` 校验。逐跳检查 Location：仍在 `https://nap.ntvu.edu.cn/cas-sso/` 下则继续，最多 3 跳；离开 `/cas-sso`（返回门户 `service`）即停止，不访问门户 SPA；指向其它 host → `PortalChanged`；指向 `/cas-sso/client/bind/…` → `NeedsAttention`（第三方账号未绑定）。若回调页含 `login-error-code`：`1030027`/`1030031`/`1410040`/`1410041` → `AuthenticationRejected`，`1030028` → `AccountLocked`，`1330001` → `AccountRisk`，`1320007`/`1320010` → `CaptchaRequired`，其它 → `NeedsAttention`。
+8. 之后以 `getCurrentNode` 是否离开 `authenticate` 为准（第 4 节轮询）。
 
 ### 2.5 请求白名单
 
-门户客户端只允许以下请求，其它路径一律在发出前拒绝并返回 `InternalError`：
+HTTP 客户端只允许以下请求，其它一律在发出前拒绝并返回 `InternalError`：
 
-- `GET https://nap.ntvu.edu.cn/`、`GET https://nap.ntvu.edu.cn/eportal/redirect.jsp`
-- `POST /eportal/network/userOnline`、`GET /eportal/adaptor/getOnlineUserInfo`、`POST /eportal/workFlow/getCurrentNode`、`POST /eportal/network/serviceSelection`、`POST /eportal/network/serviceLogin`
-- `GET`/`POST /cas-sso/login`、`GET /cas-sso/api/protected/user/captchaCount/validate`
+- `nap.ntvu.edu.cn`：`GET /`、`GET /eportal/redirect.jsp`；`POST /eportal/network/userOnline`、`GET /eportal/adaptor/getOnlineUserInfo`、`POST /eportal/workFlow/getCurrentNode`、`POST /eportal/network/serviceSelection`、`POST /eportal/network/serviceLogin`；`GET /cas-sso/login`、`GET /cas-sso/clientredirect`（仅 `client_name=adapter`）
+- `authserver.ntvu.edu.cn`：`GET`/`POST /authserver/login`、`GET /authserver/checkNeedCaptcha.htl`
 - `GET http://www.msftconnecttest.com/connecttest.txt`
 
-白名单之外包括 bundle 中出现的全部注销/下线接口：`/eportal/network/offline`、`/eportal/auth/json/logout`、`/portal/portalAuthen/logout`、`/portal/cas/getLogout`、`/cas-sso/logout`、`/eportal/adaptor/kick-offline/batch`、`/eportal/workFlow/updateUserSession` 等。前端 `checkOnlineUser()` 的风险在于其失败分支会跳转注销，不在查询接口本身；本程序不实现任何注销分支，在线查询失败只视为“状态未知”。
+白名单之外包括 bundle 中出现的全部注销/下线接口：`/eportal/network/offline`、`/eportal/auth/json/logout`、`/portal/portalAuthen/logout`、`/portal/cas/getLogout`、`/cas-sso/logout`、`/authserver/logout`、`/eportal/adaptor/kick-offline/batch`、`/eportal/workFlow/updateUserSession` 等。前端 `checkOnlineUser()` 的风险在于其失败分支会跳转注销，不在查询接口本身；本程序不实现任何注销分支，在线查询失败只视为“状态未知”。
 
 ### 2.6 未核实项
 
-`authenticate` 节点下 CAS 提交成功后，服务端如何把结果绑定到 portal 会话（推测由 `flowSessionId` 关联；前端另有 `getSidUserInfo` 携带 CAS `ticket` 的路径，用于 SID 流程），是否需要跟随 CAS 的 302，以及之后 `currentNodePath` 是否直接变为 `serviceSelection`。当前账号在线，无法观察。按第 9 节在一次手动下线后实测确认，必要时扩充白名单并更新本节；实现需对此保持容错（轮询 + 未知节点提示人工处理）。
+当前账号在线，以下无法在不提交凭据的情况下观察：第 5 步成功时的确切 Location、第 7 步跳转链，以及之后 `currentNodePath` 是否直接变为 `serviceSelection`。认证结果如何绑定到门户会话：门户 bundle 中 adapter 返回后没有携带 ticket 的接口调用（只有 SID 流程用 `getSidUserInfo`），推测由 `cas-sso` 在第 7 步按会话中的 `flowSessionId` 在服务端推进流程 [推断]。旧版 Playwright 工具从未完成过真实凭据登录（日志无 `Connected`），没有可参考的记录。按第 9 节在一次手动下线后实测确认，必要时修正本节与白名单；实现对此保持容错（轮询 + 未知节点提示人工处理）。
 
 ## 3. 架构
 
@@ -76,7 +82,7 @@ flowchart LR
   APP --> WLAN[internal/wlan<br/>SSID + 连接通知]
   APP --> PWR[internal/power<br/>唤醒通知]
   FLOW --> PORTAL[internal/portal<br/>门户 HTTP]
-  FLOW --> CAS[internal/cas<br/>CAS 登录]
+  FLOW --> CAS[internal/cas<br/>统一身份认证]
   APP --> CFG[internal/config<br/>配置 + DPAPI]
   APP --> LOG[internal/logx<br/>脱敏日志]
 ```
@@ -84,7 +90,7 @@ flowchart LR
 | 包 | 职责 |
 |---|---|
 | `internal/portal` | 门户 HTTP 客户端：`Discover`、`UserOnline`、`OnlineUserInfo`、`CurrentNode`、`Services`、`ServiceLogin`；Cookie jar；请求白名单（第 2.5 节） |
-| `internal/cas` | 解析 CAS 页面隐藏字段、验证码预检、AES-128-ECB 加密、表单提交与错误码映射 |
+| `internal/cas` | `cas-sso` 页面解析与 `clientredirect`、`authserver` 表单解析、验证码预检、AES-CBC 密码加密、表单提交、回调跳转与错误映射 |
 | `internal/flow` | `Connect(ctx) Result`，只依赖接口，可用 `httptest` 离线测试 |
 | `internal/wlan` | `wlanapi.dll`：`WlanQueryInterface` 读当前 SSID；`WlanRegisterNotification` 订阅 ACM 连接完成 |
 | `internal/power` | `PowerRegisterSuspendResumeNotification` 回调式订阅唤醒，不依赖窗口消息 |
@@ -128,7 +134,7 @@ flowchart TD
   I -- 通 --> AO[AlreadyOnline / Connected]
   I -- 不通 --> OBI[OnlineButInternetUnavailable]
   O -- offline --> N{getCurrentNode}
-  N -- authenticate --> C[CAS 登录] --> P[轮询 getCurrentNode ≤10 次] --> N
+  N -- authenticate --> C[统一身份认证<br/>cas-sso adapter → authserver] --> P[轮询 getCurrentNode ≤10 次] --> N
   N -- serviceSelection --> SV[serviceSelection 匹配 serviceValue → serviceLogin]
   SV --> V[确认在线 ≤15 次]
   N -- finish --> V
@@ -139,8 +145,8 @@ flowchart TD
 
 规则：
 - SSID 用 WLAN API 读取，不使用 `NetConnectionProfile.Name`（旧版正因此在 Name 变为 `NTVU-R 2` 后失效）。SSID 读取失败（如位置权限被拒）时记录警告并继续 Discover：只有拿到 `nap.ntvu.edu.cn` 的 `portal-main` 跳转与 sessionId 才算校园网；此时 Discover 失败归为 `NetworkNotReady`。
-- 跟随 302 手动进行：仅接受 host 精确等于 `nap.ntvu.edu.cn` 的 Location（scheme 为 http 或 https），最多 3 跳；其它 host 视为 `PortalChanged`。`portal-main` 的 Location 虽为 http，但只解析参数不访问；此后所有门户与 CAS 请求一律走 `https://nap.ntvu.edu.cn`（2026-10-08 实测 HTTPS 下 `userOnline` 与 `/cas-sso/login` 正常），凭据不经明文 HTTP 传输。
-- 节点循环最多 4 轮；CAS 每次 Connect 最多提交 1 次；`serviceLogin` 每次 Connect 最多提交 1 次。
+- 跟随 302 手动进行，逐跳校验：Discover 只接受 host 精确等于 `nap.ntvu.edu.cn` 的 Location（scheme 为 http 或 https），最多 3 跳；统一身份认证各跳按第 2.4 节校验；不符视为 `PortalChanged`。`portal-main` 的 Location 虽为 http，但只解析参数不访问；此后门户与认证请求一律走 HTTPS（2026-10-08 实测 `userOnline`、`/cas-sso/login`、`/authserver/login` 均可用），凭据不经明文 HTTP 传输。
+- 节点循环最多 4 轮；统一身份认证（第 2.4 节第 5 步）每次 Connect 最多提交 1 次；`serviceLogin` 每次 Connect 最多提交 1 次。
 - `serviceSelection` 中找不到已保存的 `serviceValue` → `ServiceNotFound`。
 - 外网探测：`GET http://www.msftconnecttest.com/connecttest.txt`，正文等于 `Microsoft Connect Test`。
 - HTTP：TLS 校验开启，`Proxy=nil`，单请求超时 7 秒，单次 Connect 总超时 60 秒；User-Agent 使用常见桌面浏览器字符串。
@@ -152,7 +158,7 @@ flowchart TD
 - 同一时刻只运行一个 Connect；运行期间到达的触发合并为一次后续执行。
 - 巡检只在当前 SSID 为目标网络（或读取失败）时进行；巡检发现离线即走完整 Connect。
 - 退避：结果为 `NetworkNotReady`/`PortalUnavailable`/`TimedOut`/`PortalChanged`/`InternalError` 时，下一次自动 Connect 间隔依次为 1、2、5 分钟（之后保持 5 分钟）；成功或在线后清零。退避期间巡检仍检测在线状态，但不提交登录。
-- 暂停自动登录直到用户在设置中修改并保存：`AuthenticationRejected`（1030027/1030031/1410040/1410041）、`AccountLocked`（1030028）、`AccountRisk`（1330001）、`CaptchaRequired`、`ServiceNotFound`、`ConfigurationRequired`。“立即连接”可手动绕过暂停。
+- 暂停自动登录直到用户在设置中修改并保存：`AuthenticationRejected`（`authserver` 返回错误页，或回调错误码 1030027/1030031/1410040/1410041）、`AccountLocked`（1030028）、`AccountRisk`（1330001）、`CaptchaRequired`、`ServiceNotFound`、`ConfigurationRequired`。“立即连接”可手动绕过暂停。
 - 唤醒与 WLAN 连接通知后延迟 3 秒再执行，等待 DHCP。
 
 ## 6. 结果状态
@@ -165,9 +171,9 @@ flowchart TD
 | `NotTargetNetwork` | 未连接 NTVU-R | 灰 |
 | `NetworkNotReady` / `PortalUnavailable` / `TimedOut` | 网络或门户暂时不可用 | 黄 |
 | `ConfigurationRequired` | 未设置学号/密码 | 红 |
-| `AuthenticationRejected` / `AccountLocked` / `AccountRisk` / `CaptchaRequired` | CAS 拒绝 | 红 |
+| `AuthenticationRejected` / `AccountLocked` / `AccountRisk` / `CaptchaRequired` | 统一身份认证拒绝 | 红 |
 | `ServiceNotFound` | 运营商不在列表中 | 红 |
-| `NeedsAttention` | 出现未支持的流程节点或未知 CAS 错误码 | 红 |
+| `NeedsAttention` | 出现未支持的流程节点、跳转或未知认证错误码 | 红 |
 | `PortalChanged` / `InternalError` | 门户结构变化或程序错误 | 红 |
 
 ## 7. 界面
@@ -186,22 +192,22 @@ flowchart TD
 ## 8. 日志与安全
 
 - 每次 Connect 记录：触发源、SSID、各请求的方法/路径/状态码/耗时、节点路径、结果状态。
-- 脱敏：sessionId、userIndex、密码、AES 密钥、execution、Cookie 一律不写入；学号只保留后 4 位；IP/MAC 保留（排障需要）。
+- 脱敏：sessionId、userIndex、密码、密码密文、盐、execution、ticket、`delegatedclientid`、Cookie 一律不写入；跳转只记 host、路径与参数名；学号只保留后 4 位；IP/MAC 保留（排障需要）。
 - 密码只以 DPAPI 密文存储；内存中仅在提交前解密。
-- 程序只向 `nap.ntvu.edu.cn` 与 `www.msftconnecttest.com` 发请求；凭据只发往 `https://nap.ntvu.edu.cn/cas-sso/login`。
+- 程序只向 `nap.ntvu.edu.cn`、`authserver.ntvu.edu.cn` 与 `www.msftconnecttest.com` 发请求；凭据只发往 `https://authserver.ntvu.edu.cn/authserver/login`（POST）。
 
 ## 9. 验证
 
 自动化（WSL 下 `go test ./...`，Windows 平台代码用 `GOOS=windows go vet`）：
-- `flow` 状态机：`httptest` 回放实测响应（本文第 2 节样本），覆盖已在线、finish、serviceSelection、未知节点、302 指向外域、各 CAS 错误码、超时。
-- `cas`：隐藏字段解析；AES 输出与 Node `crypto`（aes-128-ecb）比对；验证码预检分支。
-- `portal`：白名单外路径（含各注销接口）在发出前被拒绝；302 只认 nap；Discover 之后只发 HTTPS。
+- `flow` 状态机：`httptest` 回放实测响应（本文第 2 节样本），覆盖已在线、finish、serviceSelection、未知节点、302 指向外域、认证失败页、各回调错误码、超时。
+- `cas`：`cas-sso` 隐藏字段与 `authserver` 表单解析；加密结果用 Node `crypto`（aes-128-cbc）解密，明文为 64 位随机串 + 密码；验证码预检分支；各跳 Location 校验。
+- `portal`：白名单外路径（含各注销接口）在发出前被拒绝；Discover 之后只发 HTTPS。
 - `app`：退避序列、暂停与解除、触发合并。
 
 Windows 实机：
 - DPAPI 加解密往返、SSID 读取、单实例、开机自启写入与删除。
 - 托盘与设置窗口截图核对；已在线路径实际运行一次。
-- 离线全流程：用户在门户页面手动下线一次，运行“立即连接”，确认 CAS → 运营商 → 在线；失败时用浏览器恢复登录，依据脱敏日志修正第 2.6 节未核实项。
+- 离线全流程：用户在门户页面手动下线一次，运行“立即连接”，确认统一身份认证 → 运营商 → 在线；失败时用浏览器恢复登录，依据脱敏日志修正第 2.6 节未核实项。
 
 ## 10. 与旧版的关系
 
