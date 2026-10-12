@@ -1,0 +1,18 @@
+{
+  "RT_GROUP_ICON": {
+    "#7": {
+      "0000": "app.ico"
+    }
+  },
+  "RT_MANIFEST": {
+    "#1": {
+      "0409": {
+        "description": "校园网自动连接",
+        "minimum-os": "win10",
+        "execution-level": "as invoker",
+        "dpi-awareness": "per monitor v2",
+        "use-common-controls-v6": true
+      }
+    }
+  }
+}
