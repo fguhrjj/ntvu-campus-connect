@@ -125,13 +125,25 @@ func (w *wiring) Load() (config.Config, error) {
 	return config.Load(w.configPath, w.protector)
 }
 
-// Save writes the settings, then makes the Run key match cfg.Autostart.
+// Save makes the Run key match cfg.Autostart, then writes the settings. On
+// failure neither is left changed, so the dialog, the pause and the tray
+// toggle keep matching what is on disk.
 func (w *wiring) Save(cfg config.Config, newPassword string) error {
-	if err := config.Save(w.configPath, cfg, newPassword, w.protector); err != nil {
-		return err
-	}
 	if err := w.setAutostart(cfg.Autostart); err != nil {
 		return fmt.Errorf("开机自启设置失败：%w", err)
+	}
+	prev, loadErr := config.Load(w.configPath, w.protector)
+	if err := config.Save(w.configPath, cfg, newPassword, w.protector); err != nil {
+		restore := !cfg.Autostart
+		if loadErr == nil {
+			restore = prev.Autostart
+		}
+		if restore != cfg.Autostart {
+			if rerr := w.setAutostart(restore); rerr != nil {
+				w.log.Eventf("恢复开机自启设置失败：%v", rerr)
+			}
+		}
+		return err
 	}
 	return nil
 }

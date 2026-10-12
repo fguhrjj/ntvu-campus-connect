@@ -89,6 +89,37 @@ func TestLoggerRotatesAtOneMiB(t *testing.T) {
 	}
 }
 
+func TestLoggerKeepsWritingWhenRotationFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "campus.log")
+	// A non-empty directory at <path>.1 makes the rename fail on every OS.
+	if err := os.MkdirAll(filepath.Join(path+".1", "keep"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	l, err := NewLogger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := strings.Repeat("x", 1000)
+	for range 1100 {
+		l.Event(line)
+	}
+	l.Event("after failed rotation")
+	for range 200 {
+		l.Event(line)
+	}
+	l.Event("still logging")
+	l.Close()
+	got := readLog(t, path)
+	for _, want := range []string{"after failed rotation", "still logging"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("current log lacks %q", want)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(path+".1", "keep")); err != nil {
+		t.Fatalf("existing %s.1 was disturbed: %v", path, err)
+	}
+}
+
 func TestLoggerAppendsAcrossRestarts(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "campus.log")
 	l, _ := NewLogger(path)

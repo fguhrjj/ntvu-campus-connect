@@ -18,8 +18,10 @@ const MaxSize = 1 << 20
 type Logger struct {
 	mu       sync.Mutex
 	path     string
-	f        *os.File
+	f        *os.File // nil after a failed reopen; write retries open
 	size     int64
+	limit    int64 // rotate when a line would pass this size
+	closed   bool
 	username string
 }
 
@@ -28,7 +30,7 @@ func NewLogger(path string) (*Logger, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
-	l := &Logger{path: path}
+	l := &Logger{path: path, limit: MaxSize}
 	if err := l.open(); err != nil {
 		return nil, err
 	}
@@ -76,31 +78,40 @@ func (l *Logger) Eventf(format string, args ...any) { l.write(fmt.Sprintf(format
 func (l *Logger) write(msg string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.f == nil {
+	if l.closed || l.f == nil && l.open() != nil {
 		return
 	}
 	line := time.Now().Format("2006-01-02 15:04:05.000 ") + l.redact(msg) + "\n"
-	if l.size > 0 && l.size+int64(len(line)) > MaxSize {
+	if l.size > 0 && l.size+int64(len(line)) > l.limit {
 		l.rotate()
+		if l.f == nil {
+			return
+		}
 	}
 	n, _ := l.f.WriteString(line)
 	l.size += int64(n)
 }
 
+// rotate renames the log to <path>.1, replacing the previous generation.
+// If the rename fails (e.g. another process holds the file), it keeps
+// appending to the current file and tries again only after another
+// MaxSize/8 bytes instead of on every line.
 func (l *Logger) rotate() {
 	l.f.Close()
 	l.f = nil
-	_ = os.Remove(l.path + ".1")
-	_ = os.Rename(l.path, l.path+".1")
-	if err := l.open(); err != nil {
-		l.f = nil
+	if err := os.Rename(l.path, l.path+".1"); err != nil {
+		l.limit = l.size + MaxSize/8
+	} else {
+		l.limit = MaxSize
 	}
+	_ = l.open() // on failure the next write retries
 }
 
 // Close flushes and closes the file.
 func (l *Logger) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.closed = true
 	if l.f == nil {
 		return nil
 	}

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -202,7 +203,7 @@ func TestLoginStopsWhenAccountNeedsActivation(t *testing.T) {
 func TestLoginRejectedPasswordReturnsErrorTip(t *testing.T) {
 	f := newAuthFixture(t)
 	f.post = func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
+		w.WriteHeader(http.StatusOK)
 		io.WriteString(w, strings.Replace(minimalAuthHTML, `<span id="showErrorTip"></span>`, `<span id="showErrorTip">您提供的用户名或者密码有误</span>`, 1))
 	}
 	_, err := f.login(t)
@@ -212,6 +213,26 @@ func TestLoginRejectedPasswordReturnsErrorTip(t *testing.T) {
 	}
 	if f.postCount() != 1 {
 		t.Fatalf("credential POSTs = %d, want exactly 1", f.postCount())
+	}
+}
+
+func TestLoginNonOKPostResponseIsPortalChanged(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusTooManyRequests} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			f := newAuthFixture(t)
+			f.post = func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+				io.WriteString(w, strings.Replace(minimalAuthHTML, `<span id="showErrorTip"></span>`, `<span id="showErrorTip">请求过于频繁</span>`, 1))
+			}
+			_, err := f.login(t)
+			ce := wantKind(t, err, PortalChanged)
+			if ce.Detail != "HTTP "+strconv.Itoa(status) {
+				t.Fatalf("detail = %q", ce.Detail)
+			}
+			if f.postCount() != 1 {
+				t.Fatalf("credential POSTs = %d, want exactly 1", f.postCount())
+			}
+		})
 	}
 }
 

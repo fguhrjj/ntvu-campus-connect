@@ -14,7 +14,8 @@ var backoff = []time.Duration{time.Minute, 2 * time.Minute, 5 * time.Minute}
 type schedule struct {
 	failures int
 	nextFull time.Time   // zero: no backoff
-	paused   flow.Status // non-empty: automatic login paused until settings change
+	pause    flow.Result // Status non-empty: automatic login paused until settings change
+	failure  flow.Result // the full attempt that started or extended the backoff
 }
 
 // mode returns ModeFull when this trigger may submit credentials/service.
@@ -22,7 +23,7 @@ func (s *schedule) mode(t Trigger, now time.Time) flow.Mode {
 	if t == TriggerManual || t == TriggerSettings {
 		return flow.ModeFull
 	}
-	if s.paused != "" || now.Before(s.nextFull) {
+	if s.pause.Status != "" || now.Before(s.nextFull) {
 		return flow.ModeCheckOnly
 	}
 	return flow.ModeFull
@@ -32,11 +33,12 @@ func (s *schedule) mode(t Trigger, now time.Time) flow.Mode {
 func (s *schedule) record(m flow.Mode, r flow.Result, now time.Time) time.Time {
 	switch {
 	case r.Status.Online():
-		s.failures, s.nextFull = 0, time.Time{}
+		s.failures, s.nextFull, s.failure = 0, time.Time{}, flow.Result{}
 	case pauses(r.Status):
-		s.paused = r.Status
+		s.pause = r
 		s.failures, s.nextFull = 0, time.Time{}
 	case m == flow.ModeFull && backsOff(r.Status):
+		s.failure = r
 		s.nextFull = now.Add(backoff[min(s.failures, len(backoff)-1)])
 		s.failures++
 		return s.nextFull
@@ -44,8 +46,36 @@ func (s *schedule) record(m flow.Mode, r flow.Result, now time.Time) time.Time {
 	return time.Time{}
 }
 
+// held is what a Deferred check-only run keeps showing: the result that
+// paused automatic login, else the one that started the backoff.
+func (s *schedule) held() (flow.Result, bool) {
+	if s.pause.Status != "" {
+		return s.pause, true
+	}
+	if s.failure.Status != "" {
+		return s.failure, true
+	}
+	return flow.Result{}, false
+}
+
+// retryAfter says when the runner should raise an automatic trigger so the
+// next full attempt runs as soon as backoff ends (spec §5: 1, 2, 5 minutes
+// after each failure, not at the next patrol tick). ok is false when no
+// such retry is due: no backoff, paused, or a full attempt already ran
+// after the backoff ended.
+func (s *schedule) retryAfter(ranFull bool, now time.Time) (d time.Duration, ok bool) {
+	if s.nextFull.IsZero() || s.pause.Status != "" {
+		return 0, false
+	}
+	d = s.nextFull.Sub(now)
+	if d <= 0 && ranFull {
+		return 0, false
+	}
+	return max(d, 0), true
+}
+
 func (s *schedule) clearPause() {
-	s.paused = ""
+	s.pause, s.failure = flow.Result{}, flow.Result{}
 	s.failures, s.nextFull = 0, time.Time{}
 }
 

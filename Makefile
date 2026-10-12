@@ -23,5 +23,5 @@ windows-test:
 	mkdir -p $(WINDOWS_TEST_DIR)
 	GOOS=windows GOARCH=amd64 $(GO) test -c -o $(WINDOWS_TEST_DIR)/ ./...
 	@fail=0; for t in $(WINDOWS_TEST_DIR)/*.test.exe; do \
-		echo "== $$t"; ./$$t || fail=1; \
+		echo "== $$t"; ./$$t -test.timeout=10m || fail=1; \
 	done; exit $$fail

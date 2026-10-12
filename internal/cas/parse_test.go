@@ -50,6 +50,16 @@ func TestParseLoginFormRejectsMissingRequiredField(t *testing.T) {
 	}
 }
 
+func TestParseLoginFormRejectsMissingLT(t *testing.T) {
+	bad := strings.Replace(authFormFixture, `  <input id="lt" name="lt" value="">`+"\n", "", 1)
+	if bad == authFormFixture {
+		t.Fatal("fixture no longer contains the lt input")
+	}
+	if _, err := parseLoginForm(strings.NewReader(bad)); err == nil {
+		t.Fatal("parseLoginForm accepted a form without lt")
+	}
+}
+
 func TestParseAdapterLoginType(t *testing.T) {
 	got, err := parseElementText(strings.NewReader(authFormFixture), "current-login-type")
 	if err != nil || got != "adapter" {

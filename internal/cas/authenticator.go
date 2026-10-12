@@ -269,6 +269,9 @@ func (a *Authenticator) submit(ctx context.Context, loginURL *url.URL, f loginFo
 	loc := r.location
 	switch {
 	case loc == nil:
+		if r.status != http.StatusOK {
+			return nil, classified(step, PortalChanged, "HTTP "+strconv.Itoa(r.status), nil)
+		}
 		tip, _ := parseErrorTip(bytes.NewReader(r.body))
 		return nil, classified(step, AuthenticationRejected, tip, nil)
 	case sameOrigin(loc, a.nap) && loc.Path == "/cas-sso/login" && loc.Query().Get("ticket") != "":

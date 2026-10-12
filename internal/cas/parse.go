@@ -29,6 +29,7 @@ func parseLoginForm(r io.Reader) (loginForm, error) {
 		"cllt":      &f.CLLT,
 		"dllt":      &f.DLLT,
 	}
+	sawLT := false
 	walk(formNode, func(n *html.Node) {
 		if n.Type != html.ElementNode || n.Data != "input" {
 			return
@@ -37,6 +38,9 @@ func parseLoginForm(r io.Reader) (loginForm, error) {
 		if target := fields[name]; target != nil {
 			*target = value
 		}
+		if name == "lt" {
+			sawLT = true
+		}
 		if id == "pwdEncryptSalt" {
 			f.Salt = strings.TrimSpace(value)
 		}
@@ -44,7 +48,7 @@ func parseLoginForm(r io.Reader) (loginForm, error) {
 	if f.Action != "/authserver/login" || f.Execution == "" || f.EventID != "submit" || f.CLLT != "userNameLogin" || f.DLLT != "generalLogin" || len(f.Salt) != 16 {
 		return loginForm{}, fmt.Errorf("pwdFromId fields do not match the expected login form")
 	}
-	if _, ok := fields["lt"]; !ok {
+	if !sawLT {
 		return loginForm{}, fmt.Errorf("missing lt")
 	}
 	return f, nil

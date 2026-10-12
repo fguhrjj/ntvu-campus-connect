@@ -201,3 +201,57 @@ func TestStoreSaveAppliesAutostart(t *testing.T) {
 		t.Fatal("Save ignored the autostart failure")
 	}
 }
+
+func TestStoreSaveAutostartFailureLeavesConfigUnchanged(t *testing.T) {
+	w, _ := newTestWiring(t, &fakeNetwork{})
+	cfg := config.Default()
+	cfg.Username = "20260001"
+	if err := w.Save(cfg, ""); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(w.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w.setAutostart = func(bool) error { return errors.New("registry denied") }
+	cfg.Username = "20269999"
+	cfg.Autostart = true
+	if err := w.Save(cfg, ""); err == nil {
+		t.Fatal("Save ignored the autostart failure")
+	}
+	after, err := os.ReadFile(w.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("config changed despite the autostart failure:\n%s", after)
+	}
+}
+
+// failingProtector cannot encrypt, so config.Save fails before writing.
+type failingProtector struct{}
+
+func (failingProtector) Protect([]byte) (string, error)   { return "", errors.New("DPAPI failed") }
+func (failingProtector) Unprotect(string) ([]byte, error) { return nil, errors.New("DPAPI failed") }
+
+func TestStoreSaveFailureRestoresAutostart(t *testing.T) {
+	w, autostart := newTestWiring(t, &fakeNetwork{})
+	cfg := config.Default()
+	cfg.Username = "20260001"
+	if err := w.Save(cfg, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	w.protector = failingProtector{}
+	cfg.Autostart = true
+	if err := w.Save(cfg, "new-password"); err == nil {
+		t.Fatal("Save reported success although the config was not written")
+	}
+	if got := *autostart; len(got) != 3 || got[0] || !got[1] || got[2] {
+		t.Fatalf("autostart setter calls = %v, want [false true false] (restored to the saved value)", got)
+	}
+	if saved, err := w.Load(); err != nil || saved.Autostart {
+		t.Fatalf("Load after failed Save = %+v, %v", saved, err)
+	}
+}

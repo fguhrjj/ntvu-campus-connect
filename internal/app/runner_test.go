@@ -147,6 +147,38 @@ func TestBackoffMakesAutomaticRunsCheckOnly(t *testing.T) {
 	}
 }
 
+func TestDeferredDuringBackoffShowsBackoffReason(t *testing.T) {
+	// Leaving and rejoining NTVU-R during backoff: the Deferred run must
+	// show why login is held back, not the intermediate NotTargetNetwork.
+	h := newHarness(t, flow.PortalUnavailable, flow.NotTargetNetwork, flow.Deferred)
+	h.start(t)
+	for range 2 {
+		h.r.Trigger(TriggerTimer)
+		if m := h.next(t); m != flow.ModeCheckOnly {
+			t.Fatalf("during backoff: mode = %v, want check-only", m)
+		}
+	}
+	if st := h.lastState(t); st.Status != flow.PortalUnavailable || st.NextFull.IsZero() {
+		t.Fatalf("state = %+v, want the backoff reason PortalUnavailable", st)
+	}
+}
+
+func TestBackoffEndTriggersFullRetryWithoutTicker(t *testing.T) {
+	saved := backoff
+	backoff = []time.Duration{20 * time.Millisecond, 40 * time.Millisecond}
+	t.Cleanup(func() { backoff = saved })
+	h := newHarness(t, flow.PortalUnavailable, flow.PortalUnavailable, flow.NotTargetNetwork)
+	h.start(t) // Interval is an hour: only the backoff timer can retry
+	for i := range 2 {
+		if m := h.next(t); m != flow.ModeFull {
+			t.Fatalf("retry %d mode = %v, want full", i, m)
+		}
+	}
+	// The last full attempt neither failed with backoff nor paused: no
+	// further retries until a real trigger.
+	h.none(t)
+}
+
 func TestAuthenticationFailurePausesAutomaticTriggers(t *testing.T) {
 	h := newHarness(t, flow.AuthenticationRejected, flow.Deferred, flow.Deferred, flow.Deferred, flow.AlreadyOnline, flow.Deferred)
 	h.start(t)
@@ -160,8 +192,8 @@ func TestAuthenticationFailurePausesAutomaticTriggers(t *testing.T) {
 	if st.Paused != flow.AuthenticationRejected {
 		t.Fatalf("paused = %q; being online via the browser must not clear the pause", st.Paused)
 	}
-	if st.Status != flow.AlreadyOnline {
-		t.Fatalf("status = %s, want the latest real state AlreadyOnline", st.Status)
+	if st.Status != flow.AuthenticationRejected {
+		t.Fatalf("status = %s; after the browser session drops, Deferred must show the pause reason", st.Status)
 	}
 }
 

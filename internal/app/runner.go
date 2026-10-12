@@ -104,12 +104,19 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.Trigger(TriggerStartup)
 	ticker := time.NewTicker(or(r.Interval, time.Minute))
 	defer ticker.Stop()
+	// retry fires when backoff ends, so full retries keep the spec §5
+	// spacing instead of waiting for the next patrol tick.
+	retry := time.NewTimer(time.Hour)
+	retry.Stop()
+	defer retry.Stop()
 	var s schedule
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			r.Trigger(TriggerTimer)
+		case <-retry.C:
 			r.Trigger(TriggerTimer)
 		case <-r.wake:
 			r.mu.Lock()
@@ -122,7 +129,11 @@ func (r *Runner) Run(ctx context.Context) error {
 			if clear {
 				s.clearPause()
 			}
-			r.attempt(ctx, &s, pick(triggers))
+			mode := r.attempt(ctx, &s, pick(triggers))
+			retry.Stop()
+			if d, ok := s.retryAfter(mode == flow.ModeFull, time.Now()); ok {
+				retry.Reset(d)
+			}
 		}
 	}
 }
@@ -137,21 +148,26 @@ func pick(ts map[Trigger]bool) Trigger {
 	return TriggerTimer
 }
 
-func (r *Runner) attempt(ctx context.Context, s *schedule, t Trigger) {
+// attempt runs one connection attempt and returns the mode it used.
+func (r *Runner) attempt(ctx context.Context, s *schedule, t Trigger) flow.Mode {
 	mode := s.mode(t, time.Now())
 	r.logf("触发：%s，模式：%s", t, modeName(mode))
 	res := r.Connect(ctx, mode)
 	if ctx.Err() != nil {
-		return
+		return mode
 	}
 	now := time.Now()
 	s.record(mode, res, now)
 	r.mu.Lock()
-	prev := r.state
-	st := State{Status: res.Status, Message: res.Message, CheckedAt: now, Trigger: t, Paused: s.paused, NextFull: s.nextFull}
+	st := State{Status: res.Status, Message: res.Message, CheckedAt: now, Trigger: t, Paused: s.pause.Status, NextFull: s.nextFull}
 	if res.Status == flow.Deferred {
-		// Check-only run found the portal offline: keep showing the reason.
-		st.Status, st.Message = prev.Status, prev.Message
+		// Check-only run found the portal offline: keep showing why automatic
+		// login is held back (pause, else backoff, else the last state).
+		held, ok := s.held()
+		if !ok {
+			held = flow.Result{Status: r.state.Status, Message: r.state.Message}
+		}
+		st.Status, st.Message = held.Status, held.Message
 	}
 	r.state = st
 	r.mu.Unlock()
@@ -159,6 +175,7 @@ func (r *Runner) attempt(ctx context.Context, s *schedule, t Trigger) {
 	if r.OnState != nil {
 		r.OnState(st)
 	}
+	return mode
 }
 
 func (r *Runner) subscribe(ctx context.Context) {

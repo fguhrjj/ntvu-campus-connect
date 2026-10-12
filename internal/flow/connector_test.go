@@ -184,8 +184,8 @@ func TestConnectHonorsNodeAndPollBounds(t *testing.T) {
 			t.Fatalf("userOnline calls = %d, want 16", p.onlineCalls)
 		}
 	})
-	t.Run("node loop stops after 4 rounds", func(t *testing.T) {
-		// serviceSelection repeatedly reappearing must not resubmit serviceLogin.
+	t.Run("serviceSelection submits serviceLogin once then times out confirming online", func(t *testing.T) {
+		// Confirmation polling after serviceLogin never resubmits it.
 		p := &fakePortal{online: []bool{false}, nodes: []string{"serviceSelection"}, services: campusServices}
 		p.online = []bool{false, false}
 		c := newConnector(p, &fakeAuth{}, true)
