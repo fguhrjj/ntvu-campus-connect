@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -25,6 +26,11 @@ const (
 	replayUserMAC   = "0a0b0c0d0e0f"
 	// portalMainQuery takes the userOnline flag.
 	portalMainQuery = "sessionId=a1b2c3d4e5f6&userIp=10.18.124.235&userMac=0a0b0c0d0e0f&ssid=Ruijie&nasIp=10.255.2.250&customPageId=4&redirectUrl=http://123.123.123.123/&terminalType=pc&guestFlow=false&userOnline=%t&authSuccessSource=portal"
+	// interceptHost is the NAS origin redirect.jsp names for a signed-out
+	// client; interceptPage takes the nap origin (2026-10-13 offline capture).
+	interceptHost  = "123.123.123.123"
+	interceptQuery = "wlanuserip=10.18.124.235&wlanacname=NAS&ssid=Ruijie&nasip=10.255.2.250&mac=0a0b0c0d0e0f&t=wireless-v2-plain&url=http://123.123.123.123/"
+	interceptPage  = "<script>top.self.location.href='%s/eportal/index.jsp?" + interceptQuery + "'</script>"
 
 	userOnlineTrue  = `{"code":200,"message":null,"data":{"sessionId":"a1b2c3d4e5f6","online":true,"userIndex":"x","message":"redirect success"}}`
 	userOnlineFalse = `{"code":200,"message":null,"data":{"sessionId":"a1b2c3d4e5f6","online":false,"userIndex":"","portalSuccessUrl":null}}`
@@ -51,11 +57,12 @@ type allowAll struct{}
 
 func (allowAll) Allow(string, *url.URL) bool { return true }
 
-// replay plays nap (ePortal + cas-sso), authserver and the connectivity check
-// on httptest servers; the portal session moves as a real one would.
+// replay plays nap (ePortal + cas-sso), the NAS intercept page, authserver and
+// the connectivity check on httptest servers; the portal session moves as a
+// real one would.
 type replay struct {
-	t                    *testing.T
-	nap, auth, internet  *httptest.Server
+	t                         *testing.T
+	nap, trap, auth, internet *httptest.Server
 	afterAuth            string // node once cas-sso accepts the ticket
 	rejectCredentialPost bool   // authserver answers the POST with its 200 error page
 
@@ -69,19 +76,33 @@ func newReplay(t *testing.T, online bool, afterAuth string, reject bool) *replay
 	t.Helper()
 	rp := &replay{t: t, afterAuth: afterAuth, rejectCredentialPost: reject, online: online, node: "authenticate", counts: map[string]int{}}
 	rp.nap = httptest.NewServer(http.HandlerFunc(rp.serveNap))
+	rp.trap = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rp.count(r)
+		fmt.Fprintf(w, interceptPage, rp.nap.URL)
+	}))
 	rp.auth = httptest.NewServer(http.HandlerFunc(rp.serveAuth))
 	rp.internet = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "Microsoft Connect Test")
 	}))
 	t.Cleanup(rp.nap.Close)
+	t.Cleanup(rp.trap.Close)
 	t.Cleanup(rp.auth.Close)
 	t.Cleanup(rp.internet.Close)
 	return rp
 }
 
-// connector wires the production clients, as cmd/campusconnect does, to the replay origins.
+// connector wires the production clients, as cmd/campusconnect does, to the
+// replay origins; the intercept address dials the trap server.
 func (rp *replay) connector() *Connector {
-	hc := netguard.NewClient(allowAll{}, http.DefaultTransport, 7*time.Second)
+	var d net.Dialer
+	tr := &http.Transport{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if addr == interceptHost+":80" {
+			addr = rp.trap.Listener.Addr().String()
+		}
+		return d.DialContext(ctx, network, addr)
+	}}
+	rp.t.Cleanup(tr.CloseIdleConnections)
+	hc := netguard.NewClient(allowAll{}, tr, 7*time.Second)
 	napURL, _ := url.Parse(rp.nap.URL)
 	authURL, _ := url.Parse(rp.auth.URL)
 	return &Connector{
@@ -94,6 +115,12 @@ func (rp *replay) connector() *Connector {
 		CurrentSSID:   func() (string, error) { return "NTVU-R", nil },
 		Interval:      time.Millisecond,
 	}
+}
+
+func (rp *replay) count(r *http.Request) {
+	rp.mu.Lock()
+	rp.counts[r.Method+" "+r.Host+r.URL.Path]++
+	rp.mu.Unlock()
 }
 
 func (rp *replay) calls(key string) int {
@@ -129,6 +156,16 @@ func (rp *replay) serveNap(w http.ResponseWriter, r *http.Request) {
 	case "GET /":
 		http.Redirect(w, r, rp.nap.URL+"/eportal/redirect.jsp", http.StatusFound)
 	case "GET /eportal/redirect.jsp":
+		if online, _ := rp.state(); !online {
+			// A signed-out client is sent to the NAS intercept origin.
+			http.Redirect(w, r, "http://"+interceptHost, http.StatusFound)
+			return
+		}
+		http.Redirect(w, r, rp.nap.URL+"/portal/portal-main?"+fmt.Sprintf(portalMainQuery, true), http.StatusFound)
+	case "GET /eportal/index.jsp":
+		if r.URL.RawQuery != interceptQuery {
+			rp.t.Errorf("index.jsp query = %q", r.URL.RawQuery)
+		}
 		online, _ := rp.state()
 		http.Redirect(w, r, rp.nap.URL+"/portal/portal-main?"+fmt.Sprintf(portalMainQuery, online), http.StatusFound)
 	case "POST /eportal/network/userOnline":
@@ -250,6 +287,14 @@ func TestConnectReplaysPortalAndCASOverHTTP(t *testing.T) {
 			}
 			if n := rp.calls("POST /eportal/network/serviceLogin"); n != tc.logins {
 				t.Errorf("serviceLogin calls = %d, want %d", n, tc.logins)
+			}
+			// Signed out, Discover reaches portal-main through the NAS intercept page.
+			intercepts := 0
+			if !tc.online {
+				intercepts = 1
+			}
+			if n := rp.calls("GET " + interceptHost + "/"); n != intercepts {
+				t.Errorf("intercept page fetches = %d, want %d", n, intercepts)
 			}
 		})
 	}

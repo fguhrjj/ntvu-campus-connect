@@ -25,6 +25,9 @@ const (
 	napHost   = "nap.ntvu.edu.cn"
 	authHost  = "authserver.ntvu.edu.cn"
 	probeHost = "www.msftconnecttest.com"
+	// interceptHost answers for every HTTP site until the portal login is done;
+	// redirect.jsp sends unauthorised clients to its bare origin.
+	interceptHost = "123.123.123.123"
 )
 
 // ProductionPolicy is the request allowlist from spec §2.5. Everything else,
@@ -35,6 +38,8 @@ func ProductionPolicy() Policy {
 	return allowlist{
 		{"https", napHost, "/", get, nil},
 		{"https", napHost, "/eportal/redirect.jsp", get, nil},
+		{"http", interceptHost, "/", get, noQuery},
+		{"https", napHost, "/eportal/index.jsp", get, nil},
 		{"https", napHost, "/eportal/network/userOnline", post, nil},
 		{"https", napHost, "/eportal/adaptor/getOnlineUserInfo", get, nil},
 		{"https", napHost, "/eportal/workFlow/getCurrentNode", post, nil},
@@ -52,6 +57,8 @@ func adapterOnly(q url.Values) bool {
 	v := q["client_name"]
 	return len(v) == 1 && v[0] == "adapter"
 }
+
+func noQuery(q url.Values) bool { return len(q) == 0 }
 
 func (a allowlist) Allow(method string, u *url.URL) bool {
 	if u == nil || u.User != nil || u.Opaque != "" || u.Fragment != "" || u.Port() != "" {

@@ -17,8 +17,10 @@ import (
 	"campusconnect/internal/netguard"
 )
 
-// fakeNetwork answers like the campus portal for a signed-out user whose
-// workflow waits at the authenticate node, and records every request that
+// fakeNetwork answers like the campus network for a signed-out user (the
+// 2026-10-13 offline capture): redirect.jsp sends the client to the NAS
+// intercept page, whose script leads to index.jsp and then portal-main; the
+// workflow waits at the authenticate node. It records every request that
 // reaches the wire.
 type fakeNetwork struct {
 	mu   sync.Mutex
@@ -35,6 +37,12 @@ func (f *fakeNetwork) RoundTrip(r *http.Request) (*http.Response, error) {
 		r.Body.Close()
 	}
 	resp := &http.Response{StatusCode: http.StatusNotFound, Header: http.Header{}, Body: http.NoBody, Request: r}
+	if r.URL.Host == "123.123.123.123" && r.Method+" "+r.URL.Path == "GET /" {
+		resp.StatusCode = http.StatusOK
+		resp.Body = io.NopCloser(strings.NewReader("<script>top.self.location.href='https://nap.ntvu.edu.cn/eportal/index.jsp?" +
+			"wlanuserip=10.1.2.3&wlanacname=NAS&ssid=Ruijie&nasip=10.0.0.1&mac=aabbccddeeff&t=wireless-v2-plain&url=http://123.123.123.123/'</script>"))
+		return resp, nil
+	}
 	if r.URL.Host != "nap.ntvu.edu.cn" {
 		return resp, nil
 	}
@@ -43,6 +51,9 @@ func (f *fakeNetwork) RoundTrip(r *http.Request) (*http.Response, error) {
 		resp.StatusCode = http.StatusFound
 		resp.Header.Set("Location", "https://nap.ntvu.edu.cn/eportal/redirect.jsp")
 	case "GET /eportal/redirect.jsp":
+		resp.StatusCode = http.StatusFound
+		resp.Header.Set("Location", "http://123.123.123.123")
+	case "GET /eportal/index.jsp":
 		resp.StatusCode = http.StatusFound
 		resp.Header.Set("Location", "http://nap.ntvu.edu.cn/portal/portal-main?sessionId="+fakeSessionID+
 			"&userIp=10.1.2.3&userMac=aabbccddeeff&ssid=NTVU-R&nasIp=10.0.0.1&customPageId=4")
@@ -163,6 +174,8 @@ func TestConnectLogsSSIDAndEachRequest(t *testing.T) {
 		"NTVU-R",
 		"GET nap.ntvu.edu.cn/ 302",
 		"GET nap.ntvu.edu.cn/eportal/redirect.jsp 302",
+		"GET 123.123.123.123/ 200",
+		"GET nap.ntvu.edu.cn/eportal/index.jsp 302",
 		"POST nap.ntvu.edu.cn/eportal/network/userOnline 200",
 		"POST nap.ntvu.edu.cn/eportal/workFlow/getCurrentNode 200",
 		"authenticate",

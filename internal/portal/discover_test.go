@@ -3,6 +3,9 @@ package portal
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -41,7 +44,31 @@ func newTestClient(t *testing.T, h http.Handler) (*Client, *recorder, *httptest.
 	return NewClient(netguard.NewClient(allowAll{}, rec, 7*time.Second), base), rec, srv
 }
 
+// newInterceptClient serves the portal from nap and, like the NAS does for a
+// client it has not authorised, answers the intercept origin from trap.
+func newInterceptClient(t *testing.T, nap, trap http.Handler) (*Client, *recorder, *httptest.Server) {
+	t.Helper()
+	napSrv := httptest.NewServer(nap)
+	trapSrv := httptest.NewServer(trap)
+	t.Cleanup(napSrv.Close)
+	t.Cleanup(trapSrv.Close)
+	var d net.Dialer
+	tr := &http.Transport{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if addr == interceptHost+":80" {
+			addr = trapSrv.Listener.Addr().String()
+		}
+		return d.DialContext(ctx, network, addr)
+	}}
+	t.Cleanup(tr.CloseIdleConnections)
+	rec := &recorder{next: tr}
+	base, _ := url.Parse(napSrv.URL)
+	return NewClient(netguard.NewClient(allowAll{}, rec, 7*time.Second), base), rec, napSrv
+}
+
 const portalMainQuery = "sessionId=a1b2c3d4e5f6&userIp=10.18.124.235&userMac=0a0b0c0d0e0f&ssid=Ruijie&nasIp=10.255.2.250&customPageId=4&redirectUrl=http://123.123.123.123/&terminalType=pc&guestFlow=false&userOnline=false&authSuccessSource=portal"
+
+// interceptQuery is the index.jsp query the NAS intercept page names (2026-10-13 offline capture shape).
+const interceptQuery = "wlanuserip=10.18.124.235&wlanacname=NAS&ssid=Ruijie&nasip=10.255.2.250&mac=0a0b0c0d0e0f&t=wireless-v2-plain&url=http://123.123.123.123/"
 
 func TestDiscoverParsesFreshPortalSession(t *testing.T) {
 	var srvURL string
@@ -75,6 +102,77 @@ func TestDiscoverParsesFreshPortalSession(t *testing.T) {
 	}
 }
 
+func TestDiscoverFollowsNASInterceptPage(t *testing.T) {
+	var napURL string
+	nap := http.NewServeMux()
+	nap.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, napURL+"/eportal/redirect.jsp", http.StatusFound)
+	})
+	nap.HandleFunc("/eportal/redirect.jsp", func(w http.ResponseWriter, r *http.Request) {
+		// Offline: the portal sends the client to the bare intercept origin.
+		w.Header().Set("Location", "http://"+interceptHost)
+		w.WriteHeader(http.StatusFound)
+	})
+	nap.HandleFunc("/eportal/index.jsp", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.RawQuery != interceptQuery {
+			t.Errorf("index.jsp query = %q, want the intercept script's", r.URL.RawQuery)
+		}
+		http.Redirect(w, r, napURL+"/portal/portal-main?"+portalMainQuery, http.StatusFound)
+	})
+	trap := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/" || r.URL.RawQuery != "" {
+			t.Errorf("intercept request = %s %s", r.Method, r.URL)
+		}
+		fmt.Fprintf(w, "<script>top.self.location.href='%s/eportal/index.jsp?%s'</script>", napURL, interceptQuery)
+	})
+	c, rec, srv := newInterceptClient(t, nap, trap)
+	napURL = srv.URL
+
+	s, err := c.Discover(context.Background())
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if s.ID != "a1b2c3d4e5f6" || s.UserMAC != "0a0b0c0d0e0f" {
+		t.Fatalf("session = %+v", s)
+	}
+	host := strings.TrimPrefix(napURL, "http://")
+	want := []string{"GET " + host + "/", "GET " + host + "/eportal/redirect.jsp", "GET " + interceptHost + "/", "GET " + host + "/eportal/index.jsp"}
+	if strings.Join(rec.reqs, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("requests = %q\nwant       %q", rec.reqs, want)
+	}
+}
+
+func TestDiscoverRejectsInterceptScriptOffPortal(t *testing.T) {
+	// NAP is replaced with the portal test server's URL.
+	for name, page := range map[string]string{
+		"other host":   "<script>top.self.location.href='https://evil.example/eportal/index.jsp?x=1'</script>",
+		"relative":     "<script>top.self.location.href='/eportal/index.jsp?x=1'</script>",
+		"unknown path": "<script>top.self.location.href='NAP/eportal/logout.jsp'</script>",
+		"no script":    "<html><body>blocked</body></html>",
+	} {
+		t.Run(name, func(t *testing.T) {
+			var napURL string
+			nap := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Location", "http://"+interceptHost)
+				w.WriteHeader(http.StatusFound)
+			})
+			trap := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				io.WriteString(w, strings.ReplaceAll(page, "NAP", napURL))
+			})
+			c, rec, srv := newInterceptClient(t, nap, trap)
+			napURL = srv.URL
+			_, err := c.Discover(context.Background())
+			var pe *Error
+			if !errors.As(err, &pe) || pe.Kind != KindChanged {
+				t.Fatalf("err = %v, want KindChanged", err)
+			}
+			if len(rec.reqs) != 2 {
+				t.Fatalf("requests = %v, want only / and the intercept page", rec.reqs)
+			}
+		})
+	}
+}
+
 func TestDiscoverReadsAdvertisedOnline(t *testing.T) {
 	var srvURL string
 	c, _, srv := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -100,6 +198,10 @@ func TestDiscoverRejectsUnexpectedRedirectHost(t *testing.T) {
 		"ftp scheme":    "ftp://HOST/eportal/redirect.jsp",
 		"userinfo":      "http://user@HOST/eportal/redirect.jsp",
 		"missing state": "http://HOST/portal/portal-main?userIp=1.2.3.4",
+		// Only the bare http intercept origin is followed.
+		"intercept port":  "http://123.123.123.123:8080/",
+		"intercept https": "https://123.123.123.123/",
+		"other address":   "http://123.123.123.124/",
 	} {
 		t.Run(name, func(t *testing.T) {
 			var u *url.URL
@@ -121,7 +223,7 @@ func TestDiscoverRejectsUnexpectedRedirectHost(t *testing.T) {
 	}
 }
 
-func TestDiscoverStopsAfterThreeHops(t *testing.T) {
+func TestDiscoverStopsAfterFourHops(t *testing.T) {
 	c, rec, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", "/eportal/redirect.jsp")
 		w.WriteHeader(http.StatusFound)
@@ -131,8 +233,8 @@ func TestDiscoverStopsAfterThreeHops(t *testing.T) {
 	if !errors.As(err, &pe) || pe.Kind != KindChanged {
 		t.Fatalf("err = %v, want KindChanged", err)
 	}
-	if len(rec.reqs) != 3 {
-		t.Fatalf("requests = %d, want 3", len(rec.reqs))
+	if len(rec.reqs) != 4 {
+		t.Fatalf("requests = %d, want 4", len(rec.reqs))
 	}
 }
 

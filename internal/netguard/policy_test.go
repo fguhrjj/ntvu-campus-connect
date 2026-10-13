@@ -20,6 +20,8 @@ func TestPolicyAllowsSpecRequests(t *testing.T) {
 	allowed := []struct{ method, raw string }{
 		{http.MethodGet, "https://nap.ntvu.edu.cn/"},
 		{http.MethodGet, "https://nap.ntvu.edu.cn/eportal/redirect.jsp"},
+		{http.MethodGet, "http://123.123.123.123/"},
+		{http.MethodGet, "https://nap.ntvu.edu.cn/eportal/index.jsp?wlanuserip=x&mac=y"},
 		{http.MethodPost, "https://nap.ntvu.edu.cn/eportal/network/userOnline"},
 		{http.MethodGet, "https://nap.ntvu.edu.cn/eportal/adaptor/getOnlineUserInfo?sessionId=x"},
 		{http.MethodPost, "https://nap.ntvu.edu.cn/eportal/workFlow/getCurrentNode"},
@@ -83,6 +85,12 @@ func TestPolicyRejectsUnlistedPathOrScheme(t *testing.T) {
 		{http.MethodGet, "https://nap.ntvu.edu.cn/cas-sso/clientredirect?client_name=adapter&client_name=Wechat"},
 		// Probe only over its fixed URL.
 		{http.MethodGet, "https://www.msftconnecttest.com/redirect"},
+		// NAS intercept only as its bare origin, and its index.jsp only over https.
+		{http.MethodGet, "http://123.123.123.123/?url=x"},
+		{http.MethodGet, "http://123.123.123.123/login"},
+		{http.MethodGet, "https://123.123.123.123/"},
+		{http.MethodPost, "http://123.123.123.123/"},
+		{http.MethodGet, "http://nap.ntvu.edu.cn/eportal/index.jsp?wlanuserip=x"},
 	}
 	for _, c := range rejected {
 		if p.Allow(c.method, mustURL(t, c.raw)) {

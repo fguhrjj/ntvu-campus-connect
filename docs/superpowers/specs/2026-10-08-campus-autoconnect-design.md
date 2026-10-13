@@ -23,7 +23,17 @@ GET https://nap.ntvu.edu.cn/eportal/redirect.jsp
                                             → 302 Location: http://nap.ntvu.edu.cn/portal/portal-main?sessionId=<12hex>&userIp=…&userMac=…&ssid=Ruijie&nasIp=…&customPageId=4&…&userOnline=true|false&…
 ```
 
-不请求 `portal-main` 本身，只解析 Location 的查询参数：`sessionId`、`userIp`、`userMac`、`ssid`、`nasIp`、`customPageId`、`userOnline`。每次连接都重新发现，不缓存 sessionId。
+未认证（已下线）时 2026-10-13 实测，`redirect.jsp` 改为把客户端送往 NAS 拦截地址，多两跳：
+
+```
+GET https://nap.ntvu.edu.cn/eportal/redirect.jsp
+                                            → 302 Location: http://123.123.123.123（无路径）
+GET http://123.123.123.123/                 → 200，正文仅 <script>top.self.location.href='https://nap.ntvu.edu.cn/eportal/index.jsp?wlanuserip=…&wlanacname=NAS&ssid=Ruijie&nasip=…&mac=…&t=wireless-v2-plain&url=http://123.123.123.123/'</script>
+GET https://nap.ntvu.edu.cn/eportal/index.jsp?<同上查询>
+                                            → 302 Location: http://nap.ntvu.edu.cn/portal/portal-main?sessionId=…（无 userOnline 参数）
+```
+
+拦截页只取脚本中的 URL：必须为 `nap.ntvu.edu.cn` 的 `/eportal/index.jsp`，按 HTTPS 重建后请求，否则 `PortalChanged`。不请求 `portal-main` 本身，只解析 Location 的查询参数：`sessionId`、`userIp`、`userMac`、`ssid`、`nasIp`、`customPageId`、`userOnline`。每次连接都重新发现，不缓存 sessionId。
 
 ### 2.2 只读状态接口（JSON，`Content-Type: application/json;charset=UTF-8`）
 
@@ -61,15 +71,16 @@ GET https://nap.ntvu.edu.cn/eportal/redirect.jsp
 
 HTTP 客户端只允许以下请求，其它一律在发出前拒绝并返回 `InternalError`：
 
-- `nap.ntvu.edu.cn`：`GET /`、`GET /eportal/redirect.jsp`；`POST /eportal/network/userOnline`、`GET /eportal/adaptor/getOnlineUserInfo`、`POST /eportal/workFlow/getCurrentNode`、`POST /eportal/network/serviceSelection`、`POST /eportal/network/serviceLogin`；`GET /cas-sso/login`、`GET /cas-sso/clientredirect`（仅 `client_name=adapter`）
+- `nap.ntvu.edu.cn`：`GET /`、`GET /eportal/redirect.jsp`、`GET /eportal/index.jsp`；`POST /eportal/network/userOnline`、`GET /eportal/adaptor/getOnlineUserInfo`、`POST /eportal/workFlow/getCurrentNode`、`POST /eportal/network/serviceSelection`、`POST /eportal/network/serviceLogin`；`GET /cas-sso/login`、`GET /cas-sso/clientredirect`（仅 `client_name=adapter`）
+- `GET http://123.123.123.123/`（NAS 拦截页，无查询参数）
 - `authserver.ntvu.edu.cn`：`GET`/`POST /authserver/login`、`GET /authserver/checkNeedCaptcha.htl`
 - `GET http://www.msftconnecttest.com/connecttest.txt`
 
 白名单之外包括 bundle 中出现的全部注销/下线接口：`/eportal/network/offline`、`/eportal/auth/json/logout`、`/portal/portalAuthen/logout`、`/portal/cas/getLogout`、`/cas-sso/logout`、`/authserver/logout`、`/eportal/adaptor/kick-offline/batch`、`/eportal/workFlow/updateUserSession` 等。前端 `checkOnlineUser()` 的风险在于其失败分支会跳转注销，不在查询接口本身；本程序不实现任何注销分支，在线查询失败只视为“状态未知”。
 
-### 2.6 未核实项
+### 2.6 下线后实测（2026-10-13）
 
-当前账号在线，以下无法在不提交凭据的情况下观察：第 5 步成功时的确切 Location、第 7 步跳转链，以及之后 `currentNodePath` 是否直接变为 `serviceSelection`。认证结果如何绑定到门户会话：门户 bundle 中 adapter 返回后没有携带 ticket 的接口调用（只有 SID 流程用 `getSidUserInfo`），推测由 `cas-sso` 在第 7 步按会话中的 `flowSessionId` 在服务端推进流程 [推断]。旧版 Playwright 工具从未完成过真实凭据登录（日志无 `Connected`），没有可参考的记录。按第 9 节在一次手动下线后实测确认，必要时修正本节与白名单；实现对此保持容错（轮询 + 未知节点提示人工处理）。
+手动下线后用真实凭据完成 3 次登录（立即连接与定时触发各有），脱敏日志链路一致：`redirect.jsp` → 拦截页 `123.123.123.123/` 200 → `index.jsp` 302 → 节点 `authenticate` → `cas-sso/login` 200 → `clientredirect` 302 → `authserver/login` GET 200 → `checkNeedCaptcha.htl` 200 → `authserver/login` POST 302（第 5 步成功）→ `cas-sso/login`（带 ticket）302，一跳即离开 `/cas-sso` → 约 1 秒后节点 `serviceSelection` → `serviceLogin` 200 → `Connected`。认证结果确由 `cas-sso` 在服务端推进门户流程，无需额外接口；白名单无需再改。
 
 ## 3. 架构
 
@@ -145,7 +156,7 @@ flowchart TD
 
 规则：
 - SSID 用 WLAN API 读取，不使用 `NetConnectionProfile.Name`（旧版正因此在 Name 变为 `NTVU-R 2` 后失效）。SSID 读取失败（如位置权限被拒）时记录警告并继续 Discover：只有拿到 `nap.ntvu.edu.cn` 的 `portal-main` 跳转与 sessionId 才算校园网；此时 Discover 失败归为 `NetworkNotReady`。
-- 跟随 302 手动进行，逐跳校验：Discover 只接受 host 精确等于 `nap.ntvu.edu.cn` 的 Location（scheme 为 http 或 https），最多 3 跳；统一身份认证各跳按第 2.4 节校验；不符视为 `PortalChanged`。`portal-main` 的 Location 虽为 http，但只解析参数不访问；此后门户与认证请求一律走 HTTPS（2026-10-08 实测 `userOnline`、`/cas-sso/login`、`/authserver/login` 均可用），凭据不经明文 HTTP 传输。
+- 跟随 302 手动进行，逐跳校验：Discover 只接受 host 精确等于 `nap.ntvu.edu.cn` 的 Location（scheme 为 http 或 https），或恰为 `http://123.123.123.123[/]` 的拦截地址（第 2.1 节），最多 4 跳；统一身份认证各跳按第 2.4 节校验；不符视为 `PortalChanged`。`portal-main` 的 Location 虽为 http，但只解析参数不访问；此后门户与认证请求一律走 HTTPS（2026-10-08 实测 `userOnline`、`/cas-sso/login`、`/authserver/login` 均可用），凭据不经明文 HTTP 传输。
 - 节点循环最多 4 轮；统一身份认证（第 2.4 节第 5 步）每次 Connect 最多提交 1 次；`serviceLogin` 每次 Connect 最多提交 1 次。
 - `serviceSelection` 中找不到已保存的 `serviceValue` → `ServiceNotFound`。
 - 外网探测：`GET http://www.msftconnecttest.com/connecttest.txt`，正文等于 `Microsoft Connect Test`。
@@ -194,20 +205,20 @@ flowchart TD
 - 每次 Connect 记录：触发源、SSID、各请求的方法/路径/状态码/耗时、节点路径、结果状态。
 - 脱敏：sessionId、userIndex、密码、密码密文、盐、execution、ticket、`delegatedclientid`、Cookie 一律不写入；跳转只记 host、路径与参数名；学号只保留后 4 位；IP/MAC 保留（排障需要）。
 - 密码只以 DPAPI 密文存储；内存中仅在提交前解密。
-- 程序只向 `nap.ntvu.edu.cn`、`authserver.ntvu.edu.cn` 与 `www.msftconnecttest.com` 发请求；凭据只发往 `https://authserver.ntvu.edu.cn/authserver/login`（POST）。
+- 程序只向 `nap.ntvu.edu.cn`、`authserver.ntvu.edu.cn`、`www.msftconnecttest.com` 与未认证时的 NAS 拦截页 `http://123.123.123.123/` 发请求；凭据只发往 `https://authserver.ntvu.edu.cn/authserver/login`（POST）。
 
 ## 9. 验证
 
 自动化（WSL 下 `go test ./...`，Windows 平台代码用 `GOOS=windows go vet`）：
 - `flow` 状态机：`httptest` 回放实测响应（本文第 2 节样本），覆盖已在线、finish、serviceSelection、未知节点、302 指向外域、认证失败页、各回调错误码、超时。
 - `cas`：`cas-sso` 隐藏字段与 `authserver` 表单解析；加密结果用 Node `crypto`（aes-128-cbc）解密，明文为 64 位随机串 + 密码；验证码预检分支；各跳 Location 校验。
-- `portal`：白名单外路径（含各注销接口）在发出前被拒绝；Discover 之后只发 HTTPS。
+- `portal`：白名单外路径（含各注销接口）在发出前被拒绝；Discover 之后只发 HTTPS；未认证时经拦截页到达 `portal-main`，拦截页脚本指向其它 host/路径时拒绝。
 - `app`：退避序列、暂停与解除、触发合并。
 
 Windows 实机：
 - DPAPI 加解密往返、SSID 读取、单实例、开机自启写入与删除。
 - 托盘与设置窗口截图核对；已在线路径实际运行一次。
-- 离线全流程：用户在门户页面手动下线一次，运行“立即连接”，确认统一身份认证 → 运营商 → 在线；失败时用浏览器恢复登录，依据脱敏日志修正第 2.6 节未核实项。
+- 离线全流程：用户在门户页面手动下线一次，运行“立即连接”，确认统一身份认证 → 运营商 → 在线；失败时用浏览器恢复登录，依据脱敏日志修正第 2.6 节。2026-10-13 已完成，见第 2.6 节。
 
 ## 10. 与旧版的关系
 
